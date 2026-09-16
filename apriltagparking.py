@@ -5,6 +5,12 @@ watches the car drive back and forth parallel to the screen; this script
 finds the tag, works out how far its centre sits from the centre of the
 frame, and drives the car until that error is ~0 -- then brakes.
 
+Two refinements on a plain P controller: the apparent size of the tag tells
+us how far away the car is, and the gains scale with it (far = fast, close =
+slow), and the controller steers on where the car *will* be once the next
+Bluetooth command lands rather than where it is now, which is what stops it
+hunting back and forth across the centre line.
+
 It connects to the Double Motor on the orange Connection Card, serial 1129.
 
     source .venv/bin/activate
@@ -35,10 +41,30 @@ CARD_SERIAL = "1129"        # a string, so leading zeros survive
 TAG_ID = 0                  # the id printed on the tag taped to the car
 TAG_DICT = cv2.aruco.DICT_APRILTAG_36H11
 
-KP = 110.0                  # speed (%) per unit of normalised error
-MAX_SPEED = 45              # never drive faster than this (%)
-MIN_SPEED = 18              # below this the car stalls instead of creeping
+KP = 90.0                   # speed (%) per unit of normalised error
+MAX_SPEED = 45              # base cap, before the distance scaling
+MIN_SPEED = 14              # base floor: below this the car stalls
+SPEED_CEILING = 70          # absolute cap, however far away the car is
+SPEED_FLOOR = 9             # absolute floor, however close it is
 PATROL_SPEED = 30           # speed of the back-and-forth search sweep
+
+# Distance scaling. The tag is a known 100 mm square, so its apparent width
+# in the frame is an inverse proxy for range: small tag = far away. Gains are
+# multiplied by (reference span / measured span), so the car drives hard when
+# it is across the room and creeps when it is close. This needs no camera
+# calibration -- it is a ratio of two pixel measurements.
+DEPTH_REF_SPAN = 0.10       # tag width (fraction of frame) where gain == 1
+DEPTH_GAIN_MIN = 0.55
+DEPTH_GAIN_MAX = 1.9
+
+# Lead compensation. A frame takes ~30 ms and the BLE command another ~80 ms,
+# so by the time a brake lands the car has already moved. Steering on the
+# error projected LEAD_S into the future makes it start braking early instead
+# of sailing through the centre and correcting back -- the cause of the
+# oscillation.
+LEAD_S = 0.25               # seconds of lead
+RATE_SMOOTH = 0.6           # EMA weight on the measured error rate (0..1)
+STILL_RATE = 0.06           # |error rate| under this counts as stopped
 
 TOLERANCE = 0.02            # |error| under this (fraction of width) = centred
 RELEASE = 0.06              # ...and over this, a parked car starts driving again
@@ -49,6 +75,9 @@ PATROL_FLIP_S = 2.5         # reverse the sweep after this long with no tag
 LOST_GRACE_S = 0.4          # keep the last command this long before giving up
 COMMAND_PERIOD_S = 0.08     # BLE rate limit: at most ~12 commands a second
 SPEED_EPSILON = 3           # don't resend a speed that barely changed
+
+TAG_MM = 100.0              # printed tag size, for the HUD distance readout
+CAMERA_HFOV_DEG = 60.0      # rough webcam field of view -- HUD only, not control
 
 
 def _color_name(color):
@@ -142,7 +171,25 @@ def find_tag(detector, frame, tag_id):
     return None, None
 
 
-def draw_hud(frame, centre, quad, error, state, speed, sign):
+def tag_span(quad):
+    """Mean side length of the tag in pixels -- our stand-in for range."""
+    sides = [np.linalg.norm(quad[i] - quad[(i + 1) % 4]) for i in range(4)]
+    return float(np.mean(sides))
+
+
+def depth_gain(span_px, width_px):
+    """Gain multiplier from apparent tag size: far away = big, close = small."""
+    span = max(span_px / width_px, 1e-6)
+    return float(np.clip(DEPTH_REF_SPAN / span, DEPTH_GAIN_MIN, DEPTH_GAIN_MAX))
+
+
+def approx_distance_mm(span_px, width_px):
+    """Rough range for the HUD only, from an assumed field of view."""
+    focal_px = (width_px / 2.0) / np.tan(np.radians(CAMERA_HFOV_DEG / 2.0))
+    return TAG_MM * focal_px / max(span_px, 1e-6)
+
+
+def draw_hud(frame, centre, quad, error, state, speed, sign, lead, gain, dist):
     h, w = frame.shape[:2]
     mid = w // 2
     band = int(TOLERANCE * w)
@@ -160,6 +207,10 @@ def draw_hud(frame, centre, quad, error, state, speed, sign):
     err = "  --" if error is None else f"{error:+.3f}"
     cv2.putText(frame, f"{state}  err={err}  speed={speed:+d}  dir={sign:+d}",
                 (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, colour, 2)
+    if error is not None:
+        cv2.putText(frame,
+                    f"lead={lead:+.3f}  gain={gain:.2f}x  ~{dist / 10.0:.0f} cm",
+                    (12, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 120), 2)
     cv2.putText(frame, "f flip dir   space re-arm   q quit",
                 (12, h - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
 
@@ -171,6 +222,10 @@ def park(cap, car, detector, tag_id, sign, mirror):
     patrol_since = time.monotonic()
     last_seen = 0.0
     speed = 0
+
+    rate = 0.0                  # d(error)/dt, smoothed
+    prev_error = prev_t = None
+    gain, lead, dist = 1.0, 0.0, 0.0
 
     while True:
         ok, frame = cap.read()
@@ -188,7 +243,24 @@ def park(cap, car, detector, tag_id, sign, mirror):
         if centre is not None:
             # normalised: -0.5 = far left edge, 0 = centred, +0.5 = far right
             error = (centre[0] - w / 2.0) / w
+            span = tag_span(quad)
+            gain = depth_gain(span, w)
+            dist = approx_distance_mm(span, w)
+
+            if prev_error is not None:
+                dt = now - prev_t
+                if dt > 1e-3:
+                    measured = (error - prev_error) / dt
+                    rate = RATE_SMOOTH * rate + (1.0 - RATE_SMOOTH) * measured
+            prev_error, prev_t = error, now
             last_seen = now
+
+            # Where the car will be once this command actually takes effect.
+            lead = error + LEAD_S * rate
+        else:
+            # Re-acquiring after a dropout must not read as a huge jump.
+            prev_error = prev_t = None
+            rate = 0.0
 
         if state == "PARKED":
             speed = 0
@@ -197,19 +269,28 @@ def park(cap, car, detector, tag_id, sign, mirror):
 
         elif error is not None:
             state = "TRACK"
-            if abs(error) <= TOLERANCE:
-                centred_frames += 1
+            if abs(lead) <= TOLERANCE:
+                # On target, or heading there fast enough that braking now
+                # lands it there. Either way: stop driving.
                 speed = 0
-                if centred_frames >= HOLD_FRAMES:
-                    state = "PARKED"
-                    print(f"[park] centred (err={error:+.3f}) -- braking")
+                if abs(error) <= TOLERANCE and abs(rate) <= STILL_RATE:
+                    centred_frames += 1
+                    if centred_frames >= HOLD_FRAMES:
+                        state = "PARKED"
+                        print(f"[park] centred (err={error:+.3f}, "
+                              f"~{dist / 10.0:.0f} cm) -- braking")
+                else:
+                    centred_frames = 0
             else:
                 centred_frames = 0
-                magnitude = min(abs(error) * KP, MAX_SPEED)
-                magnitude = max(magnitude, MIN_SPEED)
-                # error > 0 means the tag sits right of centre, so drive the
-                # way that shrinks it; `sign` absorbs the car's orientation.
-                speed = int(round(-np.sign(error) * magnitude * sign))
+                # Far away, a pixel of error is many millimetres of floor, so
+                # `gain` scales both the response and its limits with range.
+                floor = max(MIN_SPEED * gain, SPEED_FLOOR)
+                ceiling = min(MAX_SPEED * gain, SPEED_CEILING)
+                magnitude = float(np.clip(abs(lead) * KP * gain, floor, ceiling))
+                # lead > 0 means the car is (headed) right of centre, so drive
+                # the way that shrinks it; `sign` absorbs the car's orientation.
+                speed = int(round(-np.sign(lead) * magnitude * sign))
 
         elif now - last_seen < LOST_GRACE_S and state == "TRACK":
             pass                                  # brief dropout: coast on
@@ -225,7 +306,7 @@ def park(cap, car, detector, tag_id, sign, mirror):
         car.drive(speed)
         car.signal(state == "PARKED")
 
-        draw_hud(frame, centre, quad, error, state, speed, sign)
+        draw_hud(frame, centre, quad, error, state, speed, sign, lead, gain, dist)
         cv2.imshow("AprilTag parking", frame)
 
         key = cv2.waitKey(1) & 0xFF
