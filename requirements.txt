@@ -1,0 +1,8 @@
+# LEGO Education SPIKE (code.legoeducation.com) Python library
+legoeducation==1.1.1
+
+# MediaPipe must stay on 0.10.x: 1.x aborts on Apple Silicon when a
+# HandLandmarker is created (fatal abort, not catchable from Python).
+mediapipe==0.10.35
+
+opencv-python==5.0.0.93
