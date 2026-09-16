@@ -5,6 +5,8 @@ watches the car drive back and forth parallel to the screen; this script
 finds the tag, works out how far its centre sits from the centre of the
 frame, and drives the car until that error is ~0 -- then brakes.
 
+It connects to the Double Motor on the orange Connection Card, serial 1129.
+
     source .venv/bin/activate
     python apriltagparking.py                 # connect to the car and park it
     python apriltagparking.py --no-robot      # vision only, no Bluetooth
@@ -23,6 +25,11 @@ import cv2
 import numpy as np
 
 import legoeducation as le
+
+# --- hardware --------------------------------------------------------------
+# Our car's Double Motor: the Connection Card is orange, serial 1129.
+CARD_COLOR = le.LEGO_COLOR_ORANGE
+CARD_SERIAL = "1129"        # a string, so leading zeros survive
 
 # --- tuning ----------------------------------------------------------------
 TAG_ID = 0                  # the id printed on the tag taped to the car
@@ -44,11 +51,18 @@ COMMAND_PERIOD_S = 0.08     # BLE rate limit: at most ~12 commands a second
 SPEED_EPSILON = 3           # don't resend a speed that barely changed
 
 
+def _color_name(color):
+    return le.LEGO_COLOR_NAME_MAP[color].removeprefix("LEGO_COLOR_").lower()
+
+
 class Car:
     """The Double Motor, wrapped so --no-robot can stand in for hardware."""
 
-    def __init__(self, enabled=True):
+    def __init__(self, enabled=True, card_color=CARD_COLOR,
+                 card_serial=CARD_SERIAL):
         self.enabled = enabled
+        self.card_color = card_color
+        self.card_serial = card_serial
         self.motor = None
         self._last_speed = None
         self._last_sent = 0.0
@@ -58,9 +72,11 @@ class Car:
         if not self.enabled:
             print("[car] --no-robot: running vision only")
             return
-        print("[car] scanning for a Double Motor over Bluetooth...")
+        print(f"[car] scanning for the Double Motor on Connection Card "
+              f"{_color_name(self.card_color)} {self.card_serial}...")
         self.motor = le.DoubleMotor()
-        self.motor.connect()
+        self.motor.connect(card_color=self.card_color,
+                           card_serial=self.card_serial)
         self.motor.movement_set_end_state(le.MOTOR_END_STATE_BRAKE)
         print("[car] connected")
 
@@ -228,6 +244,8 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--camera", type=int, default=0, help="webcam index")
     ap.add_argument("--tag-id", type=int, default=TAG_ID)
+    ap.add_argument("--card-serial", default=CARD_SERIAL,
+                    help="Connection Card serial (default: %(default)s)")
     ap.add_argument("--no-robot", action="store_true",
                     help="skip Bluetooth; just show the tracking overlay")
     ap.add_argument("--flip-direction", action="store_true",
@@ -240,7 +258,7 @@ def main():
     if not cap.isOpened():
         sys.exit(f"could not open camera {args.camera}")
 
-    car = Car(enabled=not args.no_robot)
+    car = Car(enabled=not args.no_robot, card_serial=args.card_serial)
     try:
         car.connect()
         park(cap, car, make_detector(), args.tag_id,
