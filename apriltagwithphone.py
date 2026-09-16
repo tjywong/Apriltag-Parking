@@ -119,7 +119,7 @@ FOCAL_FIT_MAX = 2.0
 FOCAL_MIN_TURN_DEG = 8.0    # too small a turn measures mostly noise
 SEARCH_STEP_DEG = 25.0      # spin-and-look step while hunting for the tag
 
-OBS_FRAMES = 7              # detections to median together for one fix
+OBS_FRAMES = 11             # detections to median together for one fix
 OBS_TIMEOUT_S = 1.5         # ...before giving up and calling the tag lost
 SETTLE_S = 0.35             # let the camera settle after the car stops
 
@@ -130,6 +130,19 @@ SETTLE_S = 0.35             # let the camera settle after the car stops
 #                  far enough, so the next cycle simply trims it.
 PARKED_QUIET_MM = 15.0      # once parked, only speak up if the fix shifts
 PARKED_QUIET_DEG = 1.0      # ...by more than this
+
+# Hysteresis. Range from a tag's apparent size carries a few cm of noise at
+# a metre, so re-engaging at the same threshold we arrived on means noise
+# alone sends the car off again. Leave PARKED only on a real change.
+RELEASE_MM = 85.0
+RELEASE_DEG = 4.0
+
+# A fix that disagrees with the move we just made is not evidence, it is a
+# bad measurement -- a partly-seen tag reads small, and small reads far.
+# Re-measure rather than act, unless it keeps saying the same thing (the
+# car may genuinely have been picked up and moved).
+JUMP_SLACK_MM = 150.0
+JUMP_RETRIES = 2
 
 RAN_AWAY_FRAC = 0.5         # range grew by this much of the travel = wrong side
 BAD_MOVES_BEFORE_FLIP = 2   # weaker fallback for everything else
@@ -373,9 +386,17 @@ def focal_from_hfov(width_px, hfov_deg=DEFAULT_HFOV_DEG):
     return (width_px / 2.0) / np.tan(np.radians(hfov_deg / 2.0))
 
 
-def range_mm(span_px, focal_px):
-    """Pinhole range from the tag's apparent size."""
-    return TAG_MM * focal_px / max(span_px, 1e-6)
+def range_mm(span_px, focal_px, offset_px=0.0):
+    """Range to the tag from its apparent size.
+
+    TAG_MM * focal / span is the distance along the OPTICAL AXIS, not the
+    distance to the tag; the two agree only when the tag is centred. Off to
+    one side the real range is longer by 1/cos(bearing), which the hypot
+    supplies directly. Skipping this read a tag 30 deg off axis as 84 cm
+    when it was really 97 cm -- and during an approach the tag is off axis
+    almost by design.
+    """
+    return TAG_MM * float(np.hypot(focal_px, offset_px)) / max(span_px, 1e-6)
 
 
 def bearing_deg(cx, width_px, focal_px, side):
@@ -534,6 +555,8 @@ def approach(stream, car, detector, tag_id, side, focal_px, mirror,
     centre_tries = 0
     centre_best = None
     parked_at = None
+    last_dist = None
+    suspect = 0
     pending = None              # what the last move was trying to achieve
     bad_moves = 0
     dist = bearing = None
@@ -554,9 +577,10 @@ def approach(stream, car, detector, tag_id, side, focal_px, mirror,
         centre, quad = find_tag(detector, frame, tag_id, detect_width)
         fix = None
         if centre is not None:
-            fix = (range_mm(tag_span(quad), focal_px),
+            offset_px = centre[0] - w / 2.0
+            fix = (range_mm(tag_span(quad), focal_px, offset_px),
                    bearing_deg(centre[0], w, focal_px, side),
-                   centre[0] - w / 2.0)
+                   offset_px)
             dist, bearing = fix[0], fix[1]
 
         if mover.failed.is_set():
@@ -585,6 +609,24 @@ def approach(stream, car, detector, tag_id, side, focal_px, mirror,
                     offset = statistics.median(s[2] for s in samples)
                     hits = len(samples)
                     samples, window_start = [], None
+
+                    # Does this fix square with the move we just made?
+                    if last_dist is not None:
+                        allowed = abs(pending[1] if pending else 0.0) \
+                            + JUMP_SLACK_MM
+                        if abs(dist - last_dist) > allowed:
+                            suspect += 1
+                            if suspect <= JUMP_RETRIES:
+                                print(f"[fix] range jumped "
+                                      f"{last_dist / 10:.1f} -> "
+                                      f"{dist / 10:.1f} cm on a "
+                                      f"{abs(pending[1]) if pending else 0:.0f} mm "
+                                      f"move -- re-measuring")
+                                dist = bearing = None
+                                continue
+                        else:
+                            suspect = 0
+                    last_dist = dist
 
                     # Did the last move do what it promised?
                     if pending is not None:
@@ -670,6 +712,11 @@ def approach(stream, car, detector, tag_id, side, focal_px, mirror,
                                               f"focal {focal_px:.0f} -> "
                                               f"{fitted:.0f} px "
                                               f"(HFOV {hfov:.1f} deg)")
+                                        # Every past range was computed with
+                                        # the old focal, so rescale rather
+                                        # than flag the change as a jump.
+                                        if last_dist is not None:
+                                            last_dist *= fitted / focal_px
                                         focal_px = fitted
                                     else:
                                         print(f"[cal] focal fit out of range, "
@@ -686,13 +733,15 @@ def approach(stream, car, detector, tag_id, side, focal_px, mirror,
                                           f"{probe_expect:+.1f})")
                                 calibrated = True
                                 probe_bearing = None
-                    elif abs(dist - TARGET_MM) > DIST_TOL_MM:
+                    elif (abs(dist - TARGET_MM)
+                          > (RELEASE_MM if state == "PARKED" else DIST_TOL_MM)):
                         state = "MOVE"
                         steps = plan(dist, bearing, side)
                         pending = (dist, steps[1][1])
                         centre_tries, centre_best = 0, None
                         mover.run(steps, "approach")
-                    elif (abs(bearing) > BEARING_TOL_DEG
+                    elif (abs(bearing) > (RELEASE_DEG if state == "PARKED"
+                                          else BEARING_TOL_DEG)
                           and centre_tries < CENTRE_TRIES):
                         # Only keep nudging while the nudges are helping; a
                         # whole-degree turn cannot resolve much finer.
