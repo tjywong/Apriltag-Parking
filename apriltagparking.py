@@ -171,6 +171,10 @@ def find_tag(detector, frame, tag_id):
     return None, None
 
 
+RED = (0, 0, 255)           # BGR
+HUD_BAND = 70               # px of status text at the top of the frame
+
+
 def tag_span(quad):
     """Mean side length of the tag in pixels -- our stand-in for range."""
     sides = [np.linalg.norm(quad[i] - quad[(i + 1) % 4]) for i in range(4)]
@@ -198,10 +202,27 @@ def draw_hud(frame, centre, quad, error, state, speed, sign, lead, gain, dist):
     cv2.rectangle(frame, (mid - band, 0), (mid + band, h - 1), (0, 200, 200), 1)
 
     if quad is not None:
-        cv2.polylines(frame, [quad.astype(np.int32)], True, (0, 255, 0), 2)
-        cx, cy = int(centre[0]), int(centre[1])
-        cv2.circle(frame, (cx, cy), 5, (0, 0, 255), -1)
-        cv2.line(frame, (mid, cy), (cx, cy), (0, 0, 255), 2)
+        cv2.polylines(frame, [quad.astype(np.int32)], True, RED, 2)
+        cx, cy = int(round(centre[0])), int(round(centre[1]))
+        cv2.drawMarker(frame, (cx, cy), RED, cv2.MARKER_CROSS, 18, 2)
+        cv2.circle(frame, (cx, cy), 4, RED, -1)
+        # how far the centroid sits from the centre line, drawn to scale
+        cv2.line(frame, (mid, cy), (cx, cy), RED, 1, cv2.LINE_AA)
+        # Label the centroid above the tag, on a filled plate: red text over
+        # the tag's own black squares is unreadable, and the plate keeps it
+        # legible against whatever the tag happens to be sitting on.
+        label = f"({cx}, {cy})"
+        (tw, th), base = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        tx = int(np.clip(cx - tw // 2, 4, w - tw - 4))
+        above = int(quad[:, 1].min()) - 10
+        # ...unless that would land it on the status lines, in which case the
+        # label goes under the tag instead.
+        ty = above if above - th > HUD_BAND else int(quad[:, 1].max()) + th + 10
+        ty = int(np.clip(ty, th + 6, h - base - 4))
+        cv2.rectangle(frame, (tx - 5, ty - th - 5), (tx + tw + 5, ty + base + 3),
+                      (255, 255, 255), -1)
+        cv2.putText(frame, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    RED, 2, cv2.LINE_AA)
 
     colour = (0, 255, 0) if state == "PARKED" else (255, 255, 255)
     err = "  --" if error is None else f"{error:+.3f}"
