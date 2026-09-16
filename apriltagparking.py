@@ -106,6 +106,15 @@ class Car:
         self.motor = le.DoubleMotor()
         self.motor.connect(card_color=self.card_color,
                            card_serial=self.card_serial)
+        # connect() reports failure by printing and returning, not by raising,
+        # so without this check we would drive on happily against no hub.
+        if not self.motor.connected:
+            self.motor = None
+            raise ConnectionError(
+                f"no Double Motor on Connection Card "
+                f"{_color_name(self.card_color)} {self.card_serial}. "
+                f"Is the hub powered on, in range, and not still paired to "
+                f"another app or an earlier run?")
         self.motor.movement_set_end_state(le.MOTOR_END_STATE_BRAKE)
         print("[car] connected")
 
